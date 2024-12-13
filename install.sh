@@ -91,7 +91,4 @@ chmod +x /usr/local/bin/spiderfoot
 # Additional pip package installs
 pip3 install wafw00f arjun sherlock-project bbot --break-system-packages
 
-# Ensure all tools are accessible
-chmod -R 755 /usr/local/bin
-
 echo "GitHub package installation complete!"
