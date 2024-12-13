@@ -12,11 +12,6 @@ fi
 apt-get update
 apt-get install -y git wget unzip python3-pip golang curl
 
-# Wifite2
-git clone https://github.com/derv82/wifite2.git /usr/local/bin/.wifite2
-ln -sf /usr/local/bin/.wifite2/Wifite.py /usr/local/bin/wifite
-ln -sf /usr/bin/python3 /usr/bin/python
-
 # Knock
 git clone https://github.com/guelfoweb/knock.git /usr/local/bin/.knock
 cd /usr/local/bin/.knock
