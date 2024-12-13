@@ -14,6 +14,12 @@ import threading
 import re
 import boto3
 import botocore
+import socket
+import concurrent.futures
+from bbot.scanner import Scanner
+import logging
+
+
 
 # ANSI color codes
 GREEN = '\033[0;32m'
@@ -27,7 +33,7 @@ SPINNER_CHARS = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', 
 
 # Array of build steps
 BUILD_STEPS = [
-    "Running Knockpy scan",
+    "Running BBOT scan",
     "Fetching TXT records",
     "Running Gospider scan",
     "Running DNSReaper scan",
@@ -41,11 +47,8 @@ BUILD_STEPS = [
 
 VAULT_FOLDER = os.path.expanduser("~/secos-vault")
 
-SUBDOMAINS_WORDLIST = "/usr/local/bin/.recon/config/wordlists/subdomains_default.txt"
-SUBDOMAINS_FULL_WORDLIST = "/usr/local/bin/.recon/config/wordlists/subdomains_full.txt"
-
-CLOUDBRUTE_WORDLIST = "/usr/local/bin/.recon/config/wordlists/cloudbrute_large.txt"
-CLOUDBRUTE_CONFIG = "/usr/local/bin/.recon/config/cloudbrute.conf"
+CLOUDBRUTE_WORDLIST = "./config/wordlists/cloudbrute_large.txt"
+CLOUDBRUTE_CONFIG = "./config/cloudbrute.conf/config.yaml"
 
 FFUF_DEFAULT_CONFIG = "/usr/local/bin/.recon/config/ffuf/ffuf_default.conf"
 FFUF_FULL_CONFIG = "/usr/local/bin/.recon/config/ffuf/ffuf_full.conf"
@@ -121,7 +124,7 @@ def display_spinner(step):
 def parse_arguments():
     parser = argparse.ArgumentParser(description="secOS recon script")
     parser.add_argument("domain", nargs="?", help="The domain to scan")
-    parser.add_argument("-full", action="store_true", help="Run full scan including Amass")
+    parser.add_argument("-full", action="store_true", help="Run full scan")
     parser.add_argument("-aws", action="store_true", help="Configure AWS and use Fireprox")
     args = parser.parse_args()
     if not args.domain:
@@ -231,50 +234,6 @@ def configure_aws_and_fireprox(domain):
         print(f"Error setting up Fireprox: {e}")
         return None, None
 
-def run_knockpy_scan(domain, run_full=False):
-    wordlist = SUBDOMAINS_FULL_WORDLIST if run_full else SUBDOMAINS_WORDLIST
-    
-    # Ensure report directory exists in current directory
-    os.makedirs("report", exist_ok=True)
-    
-    knockpy_command = ["knockpy", "-d", domain, "--bruteforce", "--dns", "1.1.1.1", "--save", "report", "--wordlist", wordlist]
-    run_command(knockpy_command)
-    
-    for file_name in os.listdir("report"):
-        if file_name.startswith(f"{domain}_") and file_name.endswith(".json"):
-            return os.path.join("report", file_name)
-    print(f"No Knockpy output file found for {domain}")
-    return None
-
-def run_amass_scan(domain):
-    amass_output_file = f"amass_{domain}_output.txt"
-    amass_command = ["amass", "enum", "-passive", "-d", domain]
-    return run_command(amass_command, amass_output_file)
-
-def extract_amass_subdomains(amass_file, domain):
-    subdomains = set()
-    if amass_file and os.path.exists(amass_file):
-        with open(amass_file, "r") as file:
-            subdomains = {line.strip() for line in file if line.strip().endswith(f".{domain}")}
-    return subdomains
-
-def merge_amass_and_knockpy_data(knockpy_data, amass_file, txt_records, domain):
-    amass_subdomains = extract_amass_subdomains(amass_file, domain)
-    integrated_data = [knockpy_data[0]]
-    integrated_data.extend({"domain": subdomain, "ip": []} for subdomain in amass_subdomains if not any(item["domain"] == subdomain for item in knockpy_data))
-    integrated_data.extend(item for item in knockpy_data[1:] if item["domain"].endswith(f".{domain}"))
-    integrated_data[0]["txt_records"] = txt_records
-    for item in integrated_data:
-        item = {k: v for k, v in item.items() if v and not (k == "cert" and v == [None, None])}
-    return integrated_data
-
-def generate_subdomains_list(scan_data, domain):
-    subdomains_file = f"{domain}_subdomains.txt"
-    www_subdomain = f"www.{domain}"
-    with open(subdomains_file, "w") as file:
-        file.writelines(f"{item['domain']}\n" for item in scan_data[1:] if item["domain"] not in {domain, www_subdomain})
-    return subdomains_file
-
 def fetch_txt_records(domain, max_retries=3, retry_delay=5):
     txt_command = ["dig", "@1.1.1.1", domain, "txt", "+short"]
     for _ in range(max_retries):
@@ -285,35 +244,59 @@ def fetch_txt_records(domain, max_retries=3, retry_delay=5):
     print(f"Max retries reached. Skipping TXT record retrieval for {domain}.")
     return []
 
-def run_concurrent_scans(domain, run_full):
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        # Start Knockpy scan
-        task_tracker.start_task(0)
-        knockpy_future = executor.submit(run_knockpy_scan, domain, run_full)
-        
-        # Start TXT records scan
-        task_tracker.start_task(1)
-        txt_records_future = executor.submit(fetch_txt_records, domain)
-        
-        # Start Amass scan if running full scan
-        amass_future = None
-        if run_full:
-            task_tracker.start_task(2)
-            amass_future = executor.submit(run_amass_scan, domain)
-        
-        # Wait for results and mark tasks as complete when they finish
-        knockpy_output_file = knockpy_future.result()
-        task_tracker.complete_task(0)
-        
-        txt_records = txt_records_future.result()
-        task_tracker.complete_task(1)
-        
-        amass_output_file = None
-        if run_full:
-            amass_output_file = amass_future.result()
-            task_tracker.complete_task(2)
+def is_subdomain_active(subdomain):
+    try:
+        socket.gethostbyname(subdomain)
+        return True
+    except socket.gaierror:
+        return False
+
+def run_bbot_scan(domain):
+    """
+    Run a BBOT scan for subdomain enumeration and return the path to the subdomains file.
     
-    return knockpy_output_file, amass_output_file, txt_records
+    Args:
+        domain (str): The domain to scan
+        
+    Returns:
+        str: Path to the subdomains.txt file containing active subdomains
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"bbot_scan_{timestamp}"
+    
+    # Create Scanner instance with silent flag and passive subdomain enumeration
+    scan = Scanner(
+        domain, 
+        presets=["subdomain-enum"], 
+        output_dir=output_dir,
+        silent=True,
+        config={
+            "modules_config": {"httpx": {"timeout": 5}},
+            "scope": {"report_distance": 0}  # Only report in-scope events
+        }
+    )
+    
+    # Run the scan
+    scan.start()
+    
+    # The subdomain file will be in a directory named after the target domain
+    domain_dir = os.path.join(output_dir, "naughty_luke")  # BBOT uses this directory name
+    subdomains_file = os.path.join(domain_dir, "subdomains.txt")
+    
+    # Wait for the file to be created with a timeout
+    max_wait = 60  # Maximum wait time in seconds
+    wait_interval = 2  # Check every 2 seconds
+    elapsed = 0
+    
+    while elapsed < max_wait:
+        if os.path.exists(subdomains_file):
+            return subdomains_file
+        time.sleep(wait_interval)
+        elapsed += wait_interval
+    
+    raise TimeoutError(f"Timeout waiting for subdomains file at {subdomains_file}")
+    
+   
 
 def run_parallel_scans(domain, subdomains_file, scan_data, use_proxy=False):
     scan_functions = {
@@ -651,8 +634,6 @@ if __name__ == "__main__":
     if args is None:
         sys.exit(1)
     
-    knockpy_output_file = None
-    amass_output_file = None
     output_file = None
     subdomains_file = None
     ffuf_output_files = []
@@ -669,8 +650,6 @@ if __name__ == "__main__":
         print(f"{BLUE}----------------------")
         print()
                 
-        if run_full:
-            BUILD_STEPS.insert(2, "Running Amass scan")
         for i in range(len(BUILD_STEPS)):
             task_tracker.add_task(i)
             update_step_status(i, "idle")
@@ -682,18 +661,23 @@ if __name__ == "__main__":
             print(f"\n{GREEN}AWS configured successfully")
             print(f"Fireprox proxy set up: {proxy_url}{NC}")
         
-        knockpy_output_file, amass_output_file, txt_records = run_concurrent_scans(domain, run_full)
+        # Start BBOT scan
+        task_tracker.start_task(0)
+        subdomains_file = run_bbot_scan(domain)  # This will now include only active subdomains
+        task_tracker.complete_task(0)
         
-        if knockpy_output_file:
-            with open(knockpy_output_file, "r") as file:
-                knockpy_data = json.load(file)
-            scan_data = merge_amass_and_knockpy_data(knockpy_data, amass_output_file, txt_records, domain) if run_full else knockpy_data
-            if not run_full:
-                scan_data[0]["txt_records"] = txt_records
-            output_file = f"{domain}_{'knockpy_amass' if run_full else 'knockpy'}_output.json"
-            with open(output_file, "w") as file:
-                json.dump(scan_data, file, indent=2)
-            subdomains_file = generate_subdomains_list(scan_data, domain)
+        # Start TXT records scan
+        task_tracker.start_task(1)
+        txt_records = fetch_txt_records(domain)
+        task_tracker.complete_task(1)
+        
+        if subdomains_file:
+            # Create scan_data structure
+            scan_data = [{"domain": domain, "txt_records": txt_records}]
+            with open(subdomains_file, 'r') as f:
+                for subdomain in f.readlines():
+                    scan_data.append({"domain": subdomain.strip(), "ip": []})
+            
             _, dnsreaper_data, root_waf, different_wafs, _, ffuf_output_files, arjun_results, corsy_results = run_parallel_scans(domain, subdomains_file, scan_data, use_aws)
             
             # Start spinner for creating Obsidian vault
@@ -710,7 +694,7 @@ if __name__ == "__main__":
             
             print(f"\n{GREEN}Results saved to {domain_folder}{NC}")
         else:
-            print(f"{RED}Error: No output file generated from Knockpy scan.{NC}")
+            print(f"{RED}Error: No subdomains found or BBOT scan failed.{NC}")
     
     except KeyboardInterrupt:
         print(f"\n{YELLOW}Scan interrupted by user. Cleaning up...{NC}")
@@ -721,6 +705,6 @@ if __name__ == "__main__":
         if api_id:
             delete_fireprox_api(api_id)
         
-        clean_up(knockpy_output_file, amass_output_file, output_file, subdomains_file, *ffuf_output_files, WAFW00F_OUTPUT)
+        clean_up(output_file, subdomains_file, *ffuf_output_files, WAFW00F_OUTPUT)
         
         print(f"{GREEN}Scan completed.{NC}")
